@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "./ERC20.sol";
+import "./Ownable.sol";
+import "./Math.sol";
+
+contract RICH is ERC20, Ownable {
+
+    using Math for uint256;
+
+    address public walletOrigin = 0xE9fe09A55377f760128800e6813F2E2C07db60Ad;
+    address public walletMarketProtection = 0x0bD042059368389fdC3968d671c40319dEb39F2c;
+    address public walletProgrammersAndPartners = 0xc21713ef49a48396c1939233F3B24E1c4CCD09a4;
+    address public walletPrivateInvestors = 0x252Fa9eD5F51e3A9CF1b1890f479775eFeaa653d;
+
+    address public operatorAddress;
+
+    uint256 private _maxBurnAmount = 100_000_000_000_000 * (10 ** decimals());
+    uint256 private _lastBurnDay;
+
+    uint256 private _maxStakingAmount = 60_000_000_000_000 * (10 ** decimals());
+    uint256 private _maxStakingAmountPerAccount = 100_000_000 * (10 ** decimals());
+    uint256 private _totalStakingAmount = 0;
+    uint256 private _stakingPeriod;
+    uint256 private _stakingFirstPeriod;
+    bool    private _stakingStarted = false;
+
+    uint256 private _stakingFirstPeriodReward = 1644;
+    uint256 private _stakingSecondPeriodReward = 822;
+    
+    uint256 private _deployedTime = block.timestamp;
+    uint256 private _burnedAmount = 0;
+    
+    
+    // Mapping owner address to staked token count
+    mapping (address => uint) _stakedBalances;
+    
+    // Mapping from owner to last reward time
+    mapping (address => uint) _rewardedLastTime;
+
+    event StakingSucceed(address indexed account, uint256 totalStakedAmount);
+    event WithdrawSucceed(address indexed account, uint256 remainedStakedAmount);
+
+    /**
+    * @dev modifier which requires that account must be operator
+    */
+    modifier onlyOperator() {
+        require(_msgSender() == operatorAddress, "operator: wut?");
+        _;
+    }
+
+    /**
+    * @dev modifier which requires that walletAddress is not blocked address(walletMarketProtection),
+    * until blocking period.
+    */
+    modifier onlyUnblock(address walletAddress) {
+        require(walletAddress != walletMarketProtection
+                    || block.timestamp > _deployedTime + 1825 days, "This wallet address is blocked for 5 years." );
+        _;
+    }
+
+    /**
+    * @dev Constructor: mint pre-defined amount of tokens to special wallets.
+     */
+    constructor() ERC20("RICH", "RICH") {
+        operatorAddress = _msgSender();
+        //uint totalSupply = 1_000_000_000_000_000 * (10 ** decimals());
+
+        // 66% of total supply to walletOrigin
+        _mint(walletOrigin, 660_000_000_000_000 * (10 ** decimals()));
+
+        // 10% of total supply to walletMarketProtection
+        _mint(walletMarketProtection, 100_000_000_000_000 * (10 ** decimals()));
+
+        // 12% of total supply to walletProgrammersAndPartners
+        _mint(walletProgrammersAndPartners, 120_000_000_000_000 * (10 ** decimals()));
+
+        // 12% of total supply to walletPrivateInvestors
+        _mint(walletPrivateInvestors, 120_000_000_000_000 * (10 ** decimals()));
+        
+    }
+
+    /**
+    * @dev set operator address
+    * callable by owner
+    */
+    function setOperator(address _operator) external onlyOwner {
+        require(_operator != address(0), "Cannot be zero address");
+        operatorAddress = _operator;
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `walletOrigin`, reducing the
+     * total supply.
+     *
+     * Requirements:
+     *
+     * - total burning amount can not exceed `_maxBurnAmount`
+     * - burning moment have to be 90 days later from `_lastBurnDay`
+     */
+    function burn(uint amount) external onlyOperator {
+        
+        require(_burnedAmount + amount < _maxBurnAmount, "Burning too much.");
+        require(_lastBurnDay + 90 days <= block.timestamp, "It's not time to burn. 90 days aren't passed since last burn");
+        _lastBurnDay = block.timestamp;
+
+        _burn(walletOrigin, amount);
+        _burnedAmount += amount;
+    }
+
+    /**
+     * @dev Stake `amount` tokens from `msg.sender` to `walletOrigin`, calculate reward upto now.
+     *
+     * Emits a {StakingSucceed} event with `account` and total staked balance of `account`
+     *
+     * Requirements:
+     *
+     * - `account` must have at least `amount` tokens
+     * - staking moment have to be in staking period
+     * - staked balance of each account can not exceed `_maxStakingAmountPerAccount`
+     * - total staking amount can not exceed `_totalStakingAmount`
+     */
+    function stake(uint amount) external {
+        
+        address account = _msgSender();
+
+        if (!_stakingStarted) {
+            _stakingPeriod = block.timestamp + 730 days;
+            _stakingFirstPeriod = block.timestamp + 365 days;
+        }
+
+        require(balanceOf(account) >= amount, "insufficient balance for staking.");
+        require(block.timestamp <= _stakingPeriod, "The time is over staking period.");
+
+        _updateReward(account);
+
+        _stakedBalances[account] += amount;
+        require(_stakedBalances[account] <= _maxStakingAmountPerAccount, "This account overflows staking amount");
+        
+        _totalStakingAmount += amount;
+        require(_totalStakingAmount <= _maxStakingAmount, "Total staking amount overflows its limit.");
+        
+        _transfer(account, walletOrigin, amount);
+        
+        emit StakingSucceed(account, _stakedBalances[account]);
+    }
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`. Something different from ERC20 is
+     * adding reward which is not yet appended to account wallet.
+     */
+    function balanceOf(address account) public view override returns (uint) {
+        return ERC20.balanceOf(account) + _getAvailableReward(account);
+    }
+
+    /**
+     * @dev Get account's reward which is yielded after last rewarded time.
+     *
+     * @notice if getting moment is after stakingPeriod, the reward must be 0.
+     * 
+     * First `if` statement is in case of `lastTime` is before firstPeriod.
+     *         `lastTime`  block.timestamp(if1)                   block.timestamp(if2)
+     * ||----------|---------------|------------||------------------------|-----------||
+     *              firstPeriod                             secondPeriod
+     *
+     * Second `if` statement is in case of block.timestamp is in secondPeriod.
+     */
+    function _getAvailableReward(address account) private view returns (uint) {
+
+        if (block.timestamp > _stakingPeriod) return 0;
+        
+        uint reward = 0;
+        if (_rewardedLastTime[account] <= _stakingFirstPeriod) {
+            uint rewardDays = _stakingFirstPeriod.min(block.timestamp) - _rewardedLastTime[account];
+            rewardDays /= 1 days;
+            reward = rewardDays * _stakedBalances[account] * _stakingFirstPeriodReward / 10000;
+        }
+
+        if (block.timestamp > _stakingFirstPeriod) {
+            uint rewardDays = _stakingPeriod.min(block.timestamp) - _rewardedLastTime[account].max(_stakingFirstPeriod);
+            rewardDays /= 1 days;
+            reward += rewardDays * _stakedBalances[account] * _stakingSecondPeriodReward / 10000;
+        }
+        
+        return reward;
+    }
+
+    /**
+     * @dev Withdraw `amount` tokens from stakingPool(`walletOrigin`) to `msg.sender` address, calculate reward upto now.
+     *
+     * Emits a {WithdrawSucceed} event with `account` and total staked balance of `account`
+     *
+     * Requirements:
+     *
+     * - staked balance of `msg.sender` must be at least `amount`.
+     */
+    function withdraw(uint amount) external {
+        address account = _msgSender();
+        require (_stakedBalances[account] >= amount, "Can't withdraw more than staked balance");
+
+        _updateReward(account);
+
+        _stakedBalances[account] -= amount;
+        _totalStakingAmount -= amount;
+        _transfer(walletOrigin, account, amount);
+
+        emit WithdrawSucceed(account, _stakedBalances[account]);
+    } 
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. 
+     * Here, update from's balance by adding not-yet-appended reward.
+     *
+     * Requirements:
+     *
+     * - blocked wallet (walletMarketProtection) can't be tranferred or transfer any balance.
+     */
+    function _beforeTokenTransfer(address from, address to, uint256) internal override onlyUnblock(from) onlyUnblock(to) {
+        if (from != address(0)) {
+            _updateReward(from);
+        }
+    }
+
+    /**
+     * @dev Get account's available reward which is yielded from last rewarded moment.
+     * And append available reward to account's balance.
+     */
+    function _updateReward(address account) private {
+        uint availableReward = _getAvailableReward(account);
+        _rewardedLastTime[account] = block.timestamp;
+        _balances[account] += availableReward;
+    }
+} 
